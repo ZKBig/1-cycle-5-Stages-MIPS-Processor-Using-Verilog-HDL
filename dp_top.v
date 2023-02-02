@@ -1,0 +1,151 @@
+module dp_top(clk, rst, RegDst, RegWr, MemWr, ExtOp, 
+	      nPC_sel, ALUctr, MemtoReg, ALUSrc, j_sel, Op, Funct);
+// define the input and output pins
+input clk, rst;
+input ALUSrc, MemWr, MemtoReg, RegWr, j_sel, RegDst, nPC_sel;
+input [1:0] ExtOp, ALUctr;
+output [5:0] Op, Funct;
+
+// define the intermediate wires 
+// --------------------------------------------------------------------------------------------------
+// 1. Fetch-Decode stage wires
+wire [31:0] instruction, PC_value, instruction_out, PC_out, next_PC;
+wire[31:0] RD1_D, RD2_D, data_in_D;
+wire[4:0] RtD, RdD, RsD;
+wire[15:0] imm16D;
+
+// --------------------------------------------------------------------------------------------------
+// 2. Decode-Execute Stage Wires
+wire RegWriteE, MemtoRegE, MemWriteE, ALUsrcE, RegDstE;
+wire [1:0] ALUControlE;
+wire [31:0] RD1_E, RD2_E;
+wire [4:0] RtE, RdE, RsE;
+wire [31:0] imm32D, imm32E;
+wire [31:0] data_in_E;
+
+// --------------------------------------------------------------------------------------------------
+// 3. Execute-Memory Stage Wires
+wire [4:0] WriteRegE, WriteRegM;
+wire[31:0] ALU_out_E, ALU_out_M, Mux2_out; 
+
+// --------------------------------------------------------------------------------------------------
+// 4. Memory-WriteBack Stage Wires
+wire RegWriteM, MemtoRegM, MemWriteM;
+wire [31:0] WriteDataM, ReadDataM;
+
+wire MemtoRegW, RegWriteW;
+wire[31:0] ALUOutW, ReadDataW;
+wire[4:0] WriteRegW;
+
+// --------------------------------------------------------------------------------------------------
+// 5. WriteBack Stage Wires
+wire[31:0] ResultW;
+
+// --------------------------------------------------------------------------------------------------
+// J instruction 
+wire[25:0] j_value_D;
+
+// --------------------------------------------------------------------------------------------------
+// Data Hazard
+wire [31:0] SrcAE;
+wire [31:0] FBE_out;
+
+wire [1:0] ForwardAE, ForwardBE;
+wire FlushE, StallF, StallD;
+
+// --------------------------------------------------------------------------------------------------
+// Control Hazard
+wire PCSrcD, ForwardAD, ForwardBD, EqualD;
+wire [31:0] AD_out, BD_out;
+
+//1. Fetch Stage
+IFU ifu(.PCSrcD(PCSrcD), .instruction(instruction), 
+	.PC_value(PC_value), .clk(clk), .rst(rst), .j_sel(j_sel),
+	.next_PC(next_PC), .StallF(StallF));
+
+IF_ID ifid(.instruction(instruction), .next_PC(PC_value), .clk(clk), .StallD(StallD),
+	   .instruction_out(instruction_out), .reset(rst), .PC_out(PC_out), .clr(PCSrcD));
+
+//------------------------------------------------------------------------------------------
+//2. Decode Stage
+// seperate the instruction
+assign RtD = instruction_out[20:16];
+assign RdD = instruction_out[15:11];
+assign RsD = instruction_out[25:21];
+assign Op = instruction_out[31:26];
+assign Funct = instruction_out[5:0];
+assign imm16D = instruction_out[15:0];
+assign j_value_D = instruction_out[25:0];
+
+GPR gpr( .regWr(RegWriteW), .busW(ResultW), .clk(clk), .RD1(RD1_D),
+	 .WriteReg(WriteRegW), .RD2(RD2_D), .data_in(data_in_D), .rst(rst), .A2(RtD),
+	 .A1(RsD));
+
+EXT ext(.imm16(imm16D), .out32(imm32D), .ExtOp(ExtOp));
+
+PC_ALU pcalu(.j_sel(j_sel), .j_value(j_value_D), .ext_imm32(imm32D), .next_PC(next_PC), .PC_value(PC_out));
+
+// control hazard forwarding 1
+ForwardADMUX forad(.RD1(RD1_D), .ALUOutM(ALU_out_M), .ForwardAD(ForwardAD), .AD_out(AD_out));
+
+// control hazard forwarding 2
+ForwardBDMUX forbd(.RD2(RD2_D), .ALUOutM(ALU_out_M), .ForwardBD(ForwardBD), .BD_out(BD_out));
+
+// beq branch comparator
+Comparator cpt(.AD(AD_out), .BD(BD_out), .EqualD(EqualD));
+
+// detect whether the beq signal is legal
+assign PCSrcD = nPC_sel && EqualD;
+
+ID_EX idex(.RegWriteD(RegWr), .MemtoRegD(MemtoReg), .MemWriteD(MemWr), .ext_imm32E(imm32E),
+	   .ALUControlD(ALUctr), .ALUsrcD(ALUSrc), .RegDstD(RegDst), .ext_imm32D(imm32D),
+           .RD2_D(RD2_D), .RtD(RtD), .RdD(RdD), .RD1_D(RD1_D), .clr(FlushE),
+	   .RegWriteE(RegWriteE), .MemtoRegE(MemtoRegE), .MemWriteE(MemWriteE),
+           .ALUControlE(ALUControlE), .ALUsrcE(ALUsrcE), .RegDstE(RegDstE), .RD1_E(RD1_E),
+           .RD2_E(RD2_E), .RtE(RtE), .RdE(RdE), .clk(clk), .data_in_D(data_in_D), 
+           .data_in_E(data_in_E), .RsE(RsE), .RsD(RsD));
+
+//--------------------------------------------------------------------------------------------
+//3. Execute Stage
+MUX1 mux1(.RegDst(RegDstE), .rd(RdE), .rt(RtE), .out(WriteRegE));
+
+MUX2 mux2(.ALUSrc(ALUsrcE), .busB(FBE_out), .ext_out(imm32E), .out(Mux2_out));
+
+ALU alu(.data1(SrcAE), .data2(Mux2_out), .ALUctr(ALUControlE),.out(ALU_out_E));
+
+// forwarding module 1
+ForwardAEMUX for_AE(.RD1E(RD1_E), .ResultW(ResultW), .ALUOutM(ALU_out_M), .ForwardAE(ForwardAE), .SrcAE(SrcAE));
+
+// forwarding module 2
+ForwardBEMUX for_BE(.RD2E(RD2_E), .ResultW(ResultW), .ALUOutM(ALU_out_M), .ForwardBE(ForwardBE), .SrcBE(FBE_out));
+
+EX_MEM exmem(.RegWriteE(RegWriteE), .MemtoRegE(MemtoRegE), .MemWriteE(MemWriteE), 
+             .clk(clk), .ALUOutE(ALU_out_E), .WriteDataE(FBE_out), .WriteRegE(WriteRegE), 
+	     .RegWriteM(RegWriteM), .MemtoRegM(MemtoRegM), .MemWriteM(MemWriteM),
+             .ALUOutM(ALU_out_M), .WriteDataM(WriteDataM), .WriteRegM(WriteRegM));
+
+//--------------------------------------------------------------------------------------------
+//4. Memory Stage
+DM data_memory(.data_in(WriteDataM), .clk(clk), .WrEn(MemWriteM), .Addr(ALU_out_M), 
+	       .out(ReadDataM), .rst(rst));
+MEM_WB memwb(.RegWriteM(RegWriteM), .MemtoRegM(MemtoRegM), .ALUOutM(ALU_out_M), .ReadDataM(ReadDataM),
+             .WriteRegM(WriteRegM), .RegWriteW(RegWriteW), .MemtoRegW(MemtoRegW), .ALUOutW(ALUOutW), 
+             .ReadDataW(ReadDataW), .WriteRegW(WriteRegW), .clk(clk));
+
+//--------------------------------------------------------------------------------------------
+//5. WriteBack
+MUX3 mux3(.MemtoReg(MemtoRegW), .ALU_out(ALUOutW), .DM_out(ReadDataW), .out(ResultW));
+
+//--------------------------------------------------------------------------------------------
+// Hazard Process Unit
+Hazard_Pro hazard(.RegWriteM(RegWriteM), .RegWriteW(RegWriteW), .WriteRegM(WriteRegM), .WriteRegW(WriteRegW), 
+		  .ForwardAE(ForwardAE), .ForwardBE(ForwardBE), .RsE(RsE), .RtE(RtE), .MemtoRegE(MemtoRegE), 
+                  .FlushE(FlushE), .StallF(StallF), .StallD(StallD), .RsD(RsD), .RtD(RtD), .BranchD(nPC_sel),
+		  .RegWriteE(RegWriteE), .MemtoRegM(MemtoRegM), .WriteRegE(WriteRegE),
+		  .ForwardAD(ForwardAD), .ForwardBD(ForwardBD));
+
+
+endmodule
+
+
+
